@@ -64,6 +64,7 @@ function Feed (createStorage, key, opts) {
 
   // hooks
   this._onwrite = opts.onwrite || null
+  this._onread = opts.onread || null
 
   this._ready = thunky(open) // TODO: if open fails, do not reopen next time
   this._indexing = !!opts.indexing
@@ -697,12 +698,17 @@ Feed.prototype._readyAndPut = function (index, data, proof, cb) {
 
 Feed.prototype._write = function (index, data, nodes, sig, from, cb) {
   if (!this._onwrite) return this._writeAfterHook(index, data, nodes, sig, from, cb)
-  this._onwrite(index, data, from, writeHookDone(this, index, data, nodes, sig, from, cb))
+  this._storage.dataOffset(index, [], function (err, offset){
+    if(err) return cb(err)
+    this._onwrite(index, offset, data, from, writeHookDone(this, index, data, nodes, sig, from, cb))  
+  })
 }
 
 function writeHookDone (self, index, data, nodes, sig, from, cb) {
-  return function (err) {
+  return function (err, newdata) {
     if (err) return cb(err)
+    // TODO: necessary? Probably it is easier to use if a new array/buffer can be passed
+    if(newdata) data = newdata
     self._writeAfterHook(index, data, nodes, sig, from, cb)
   }
 }
@@ -908,11 +914,35 @@ Feed.prototype.get = function (index, opts, cb) {
     return
   }
 
+  // TODO: _onread
+  if(this._onread){
+    cb = onReadCallback(this, index, cb)
+  }
+  
   if (opts && opts.valueEncoding) cb = wrapCodec(toCodec(opts.valueEncoding), cb)
   else if (this._codec !== codecs.binary) cb = wrapCodec(this._codec, cb)
 
   this._getBuffer(index, cb)
 }
+
+function onReadCallback(self, index, cb){
+    return function(err, data){
+      self._storage.dataOffset(index, [], function (err, offset){
+        if(err) return cb(err)
+
+        self._onread(index, offset, data, done)
+      })   
+
+      function done(err, newdata){
+        if(err) return cb(err)
+
+        if(! newdata) newdata = data
+        cb(err, newdata)
+      }
+    }
+}
+
+
 
 Feed.prototype._readyAndGet = function (index, opts, cb) {
   var self = this
@@ -1009,17 +1039,28 @@ Feed.prototype._appendHook = function (batch, cb) {
   var self = this
   var missing = batch.length
   var error = null
+  var results = []  // TODO: necessary to copy array?
 
   if (!missing) return this._append(batch, cb)
-  for (var i = 0; i < batch.length; i++) {
-    this._onwrite(i + this.length, batch[i], null, done)
-  }
 
-  function done (err) {
+  var i = 0  
+  var offset = 0
+  this._onwrite(this.length, this.byteLength, batch[i], null, done)
+
+  function done(err, data) {
     if (err) error = err
-    if (--missing) return
+    
+    results[i] = data || batch[i]
+    offset += results[i].length
+    if (--missing) {
+      i++
+      // TODO: this may cause problems if the batch is too large (stack overflow)
+      self._onwrite(self.length + i, self.byteLength + offset, batch[i], null, done)
+      return
+    }
     if (error) return cb(error)
-    self._append(batch, cb)
+
+    self._append(results, cb)
   }
 }
 
